@@ -34,16 +34,30 @@ use constant USERNAME => $ENV{GITHUB_USERNAME};
 #   <https://developer.github.com/v3/oauth_authorizations/#create-a-new-authorization>
 my $github = Net::GitHub->new(
     version => 3,
-    access_token => $ENV{GITHUB_OAUTH_TOKEN}
+    access_token => $ENV{GITHUB_OAUTH_TOKEN},
 );
 
-$github->ua->default_headers(HTTP::Headers->new('Time-Zone' => 'Etc/UTC'));
+# N::G doesn't make adding headers (like If-Modified-Since for efficiency)
+# convenient, so this wraps it.  Takes N::G object and a hashref of
+# header => value.
+sub set_headers {
+    my $github = shift();
+    my $headers = shift() || {};
 
-# Make Net::GitHub's UA string follow the "software/ver.sion" RFC while we're
-# putting our own in there.
-$github->ua->agent(sprintf("ghrip (GitHub username %s) %s/%s %s",
-                           USERNAME, "perl-net-github", $Net::GitHub::VERSION,
-                           $github->ua->_agent));
+    # Wipes existing.
+    $github->ua->default_headers(HTTP::Headers->new('Time-Zone' => 'Etc/UTC'));
+    foreach my $header_name (keys(%$headers)) {
+        $github->ua->default_header($header_name => $headers->{$header_name});
+    }
+
+    # Oddly, default_headers() wipes UA's User-Agent string.
+    # Make Net::GitHub's UA string follow the "software/ver.sion" RFC while we're
+    # putting our own in there.
+    $github->ua->agent(sprintf("ghrip (GitHub username %s) %s/%s %s",
+                               USERNAME,
+                               "perl-net-github", $Net::GitHub::VERSION,
+                               $github->ua->_agent));
+}
 
 $github->set_default_user_repo('bitcoin', 'bitcoin');
 
@@ -67,6 +81,7 @@ if (-r "issues/list.json") {
 
 my $this_capture_ts = time() - 1;
 
+set_headers($github);
 my @issues = $github->issue->repos_issues({
     sort => 'created',
     direction => 'asc',
@@ -94,7 +109,7 @@ path("issues/list.json.ts")->spew_utf8($this_capture_ts);
 # Comments on issues.  Note that the issue description is rendered like a
 # comment by GitHub's site but isn't listed as one by this API.
 my $mirrored_comments;
-foreach my $issue (@$mirrored_issues[0..2]) {
+foreach my $issue (@$mirrored_issues) {
     next if !defined($issue);
     # FIXME: body is almost verbatim repetition of the issues list capture.
     #        See how the pattern evolves once we're capturing review comments.
@@ -107,12 +122,15 @@ foreach my $issue (@$mirrored_issues[0..2]) {
         $last_capture_ts = path($ts_file)->slurp_utf8();
     }
 
-    $this_capture_ts = time() - 1;
-
     say $file;
     if (-r $file) {
         $mirrored_comments = decode_json(path($file)->slurp_utf8());
     }
+
+    $this_capture_ts = time() - 1;
+
+    set_headers($github);
+
     # 'sort' and 'direction' don't appear to work on this endpoint, but 'since'
     # does.  <https://github.com/github/developer.github.com/pull/692> asks for
     # documentation of this; the dependent net-github-issue-comments.patch is
@@ -122,14 +140,23 @@ foreach my $issue (@$mirrored_issues[0..2]) {
         since => strftime("%FT%H:%M:%SZ", gmtime($last_capture_ts)),
     });
     while ($github->issue->has_next_page()) {
-        # Net::GitHub has its own rate limiting might be wrong/outdated, since
-        # comments in Query.pm say "the rate limit is per minute, not per day"
-        # but the API docs say per hour.
-	sleep(1);
         push(@comments, $github->issue->next_page());
     }
 
-    foreach my $comment (@comments) {
+    my @review_comments = ();
+    if (exists($issue->{pull_request})) {
+        @review_comments = $github->pull_request->comments($issue->{number}, {
+            since => strftime("%FT%H:%M:%SZ", gmtime($last_capture_ts)),
+            # FIXME: implement 'since' in $github->pull_request->comments()
+        });
+        while ($github->issue->has_next_page()) {
+            push(@review_comments, $github->issue->next_page());
+        }
+    }
+
+    # Mixing PR review comments with normal relies on their 'id' field sets
+    # being disjoint; the API docs make no explicit guarantee of this!
+    foreach my $comment (@comments, @review_comments) {
         my $updated = first_index { $_->{id} == $comment->{id} } @$mirrored_comments;
         if ($updated > -1) {
             $mirrored_comments->[$updated] = $comment;
@@ -138,8 +165,9 @@ foreach my $issue (@$mirrored_issues[0..2]) {
         }
     }
 
+    @$mirrored_comments = sort { $a->{created_at} cmp $b->{created_at} } @$mirrored_comments;
     printf("Writing %d comments on issue $issue->{number} (%d updated)...\n",
-           scalar(@$mirrored_comments), scalar(@comments));
+           scalar(@$mirrored_comments), scalar(@comments) + scalar(@review_comments));
     path($file)->spew_utf8(to_json($mirrored_comments, {utf8 => 1, pretty => 1,
                                                         canonical => 1}));
     path($ts_file)->spew_utf8($this_capture_ts);
