@@ -21,16 +21,19 @@ use warnings;
 use feature 'say';
 use Data::Dumper;
 use POSIX qw(strftime);
+use IO::Handle;
 
 use List::MoreUtils qw(first_index);
 use Path::Tiny qw(path);
-use HTTP::Status qw(:constants);
 use JSON;
 use Pithub;
 
 # The API guide politely asks users to put a username in the UA string for ease
 # of contacting authors of malfunctioning/problematic clients.
 use constant USERNAME => $ENV{GITHUB_USERNAME};
+
+# Easier to see progress if STDOUT is hot.
+STDOUT->autoflush(1);
 
 # Token auth raises our rate limit, only (needs no permissions at all).
 # Obtained using the procedure at:
@@ -59,7 +62,10 @@ if (-r "issues/list.json.ts") {
     $issues_ts = path("issues/list.json.ts")->slurp_utf8();
 }
 
-# All issues we've mirrored, indexed by issue number.
+# All issues we've mirrored, indexed by issue number.  For PRs, this includes
+# only that bit of data common between issues and PRs.  GitHub sometimes
+# deletes issues, presumably for spam reasons, so there are a handful of
+# undefs.
 my $mirrored_issues = [];
 
 if (-r "issues/list.json") {
@@ -82,13 +88,12 @@ my $new_updated = 0;
 while (my $issue = $issues->next) {
     $mirrored_issues->[$issue->{number} - 1] = $issue;
     $new_updated++;
+    printf "\r%5d new/updated issues mirrored...", $new_updated;
 }
+say "done";
 
 if ($new_updated) {
-    # If you're seeing these numbers not match on a first run, you're probably
-    # seeing github spam deletion.
-    printf("Writing %d issues (%d new/updated)...\n",
-           scalar(@$mirrored_issues), $new_updated);
+    printf("Saving %d new/updated issues...\n", $new_updated);
     path("issues/list.json")->spew_utf8(to_json($mirrored_issues,
                                                 {utf8 => 1, pretty => 1,
                                                  canonical => 1}));
@@ -97,8 +102,54 @@ if ($new_updated) {
     say "No new/updated issues.";
 }
 
-# FIXME: Save PR extra data too!  Commit hashes are not in issue data.
+# When did we last save anything?  A UNIX timestamp.  Default to grabbing
+# everything to seed a first run.
+my $PRs_ts = 0;
 
+# Git doesn't store timestamps, so keep our own to make API interaction as
+# incremental as possible.  We could probably eliminate this by finding
+# max(updated_at) over all mirrored data.
+if (-r "issues/PRs/list.json.ts") {
+    $PRs_ts = path("issues/PRs/list.json.ts")->slurp_utf8();
+}
+
+# All PRs we've mirrored, indexed by number.  Any indices that are issues but
+# not PRs will be undef (that's about a third of them, last I looked).
+my $mirrored_PRs = [];
+
+if (-r "issues/PRs/list.json") {
+    $mirrored_PRs = decode_json(path("issues/PRs/list.json")->slurp_utf8());
+}
+
+$this_capture_ts = time() - 1;
+
+my $PRs = $github->pull_requests->list(
+    params => {
+        sort => 'created',
+        direction => 'asc',
+        state => 'all',
+        since => strftime("%FT%H:%M:%SZ", gmtime($PRs_ts)),
+    },
+);
+
+$new_updated = 0;
+
+while (my $PR = $PRs->next) {
+    $mirrored_PRs->[$PR->{number} - 1] = $PR;
+    $new_updated++;
+    printf "\r%5d new/updated PRs mirrored...", $new_updated;
+}
+say "done";
+
+if ($new_updated) {
+    printf("Saving %d new/updated PRs...\n", $new_updated);
+    path("issues/PRs/list.json")->spew_utf8(to_json($mirrored_PRs,
+                                                {utf8 => 1, pretty => 1,
+                                                 canonical => 1}));
+    path("issues/PRs/list.json.ts")->spew_utf8($this_capture_ts);
+} else {
+    say "No new/updated PRs.";
+}
 
 # The events API seems to return a Last-Modified, but AFAICT it's inaccurate,
 # meaning we have to store the ETag of our last poll.  Also we can only ever
@@ -177,6 +228,10 @@ path("events.ts")->spew_utf8($this_capture_ts);
 # Need to refresh every issue if we've dropped any events.
 if ($dropped_some_events) {
     @issues_to_refresh = @$mirrored_issues;
+    say "Events API has expired some events we never saw.  Must recheck every";
+    say "issue for new/updated comments (slow!).  This is expected on the";
+    say "first run; otherwise, avoid this in future by running me more";
+    say "frequently.";
 }
 
 # Comments on issues.  Note that the issue description is rendered like a
@@ -249,9 +304,15 @@ foreach my $issue (@issues_to_refresh) {
     }
 
     @$mirrored_comments = sort { $a->{created_at} cmp $b->{created_at} } @$mirrored_comments;
-    printf("Writing %d comments on issue $issue->{number} (%d updated)...\n",
-           scalar(@$mirrored_comments), scalar(@comments) + scalar(@review_comments));
+    printf("Saving %d new/updated comments to issue $issue->{number}...\n",
+           scalar(@comments) + scalar(@review_comments));
     path($file)->spew_utf8(to_json($mirrored_comments, {utf8 => 1, pretty => 1,
                                                         canonical => 1}));
     path($ts_file)->spew_utf8($this_capture_ts);
 }
+
+if (!@issues_to_refresh) {
+    say "No issues need their issue comments or PR review comments refreshed.";
+}
+
+say "Done.";
