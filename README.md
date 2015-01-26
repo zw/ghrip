@@ -31,5 +31,8 @@ moving from Net::Github to Pithub) which will probably bite you on the first
 run on any larger repo.
 
 Takes no options or arguments but see source for environment variables.
-Populates an `issues/` subdirectory in the CWD with various data (`*.json`) and
-state (`*.ts`, `*.etag`).
+Populates an `issues/` subdirectory in the CWD with various data (`*.json`).
+Also leaves `state.json` in the CWD for incremental updates, not intended to be
+checked in.
+
+Licence: [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)
